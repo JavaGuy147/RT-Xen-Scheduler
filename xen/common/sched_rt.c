@@ -4,6 +4,7 @@
  *
  * by Sisu Xi, 2013, Washington University in Saint Louis
  * and Meng Xu, 2014, University of Pennsylvania
+ * and Dagaen Golomb, 2015, University of Pennsylvania
  *
  * based on the code of credit Scheduler
  */
@@ -134,6 +135,7 @@ struct rt_private {
     struct list_head sdom;      /* list of availalbe domains, used for dump */
     struct list_head runq;      /* ordered list of runnable vcpus */
     struct list_head depletedq; /* unordered list of depleted vcpus */
+    struct list_head timerq;    /* ascending list of next required scheduling decision */
     cpumask_t tickled;          /* cpus been tickled */
 };
 
@@ -143,6 +145,7 @@ struct rt_private {
 struct rt_vcpu {
     struct list_head q_elem;    /* on the runq/depletedq list */
     struct list_head sdom_elem; /* on the domain VCPU list */
+    struct list_head t_elem;    /* on the timerq */
 
     /* Up-pointers */
     struct rt_dom *sdom;
@@ -156,6 +159,17 @@ struct rt_vcpu {
     s_time_t cur_budget;        /* current budget */
     s_time_t last_start;        /* last start time */
     s_time_t cur_deadline;      /* current deadline for EDF */
+    
+    /* This allows us to store timerq info in vcpu info.
+     * This is useful because it bounds the queue size and prevents
+     * the need for memory allocation or deallocation. Memory is
+     * allocated for the timerq when each vcpu struct is allocated.
+     * This also timerq changes easy, since when changing the vcpu data
+     * we can change this value and immediately perform the adjustment
+     * to keep the queue sorted. Each vcpu only needs to remember the
+     * next time it may need scheduling action, preventing the need
+     * to worry about a growing timer queue. */
+    s_time_t next_sched_needed; /* next time to make scheduling decision */
 
     unsigned flags;             /* mark __RTDS_scheduled, etc.. */
 };
@@ -192,6 +206,11 @@ static inline struct list_head *rt_runq(const struct scheduler *ops)
     return &rt_priv(ops)->runq;
 }
 
+static inline struct list_head *rt_timerq(const struct scheduler *ops)
+{
+    return &rt_priv(ops)->timerq;
+}
+
 static inline struct list_head *rt_depletedq(const struct scheduler *ops)
 {
     return &rt_priv(ops)->depletedq;
@@ -210,6 +229,12 @@ static struct rt_vcpu *
 __q_elem(struct list_head *elem)
 {
     return list_entry(elem, struct rt_vcpu, q_elem);
+}
+
+static struct rt_vcpu *
+__t_elem(struct list_head *elem)
+{
+    return list_entry(elem, struct rt_vcpu, t_elem);
 }
 
 /*
@@ -231,7 +256,7 @@ rt_dump_vcpu(const struct scheduler *ops, const struct rt_vcpu *svc)
 
     cpumask_scnprintf(cpustr, sizeof(cpustr), svc->vcpu->cpu_hard_affinity);
     printk("[%5d.%-2u] cpu %u, (%"PRI_stime", %"PRI_stime"),"
-           " cur_b=%"PRI_stime" cur_d=%"PRI_stime" last_start=%"PRI_stime"\n"
+           " cur_b=%"PRI_stime" cur_d=%"PRI_stime" last_start=%"PRI_stime" next_sched=%"PRI_stime"\n"
            " \t\t onQ=%d runnable=%d cpu_hard_affinity=%s ",
             svc->vcpu->domain->domain_id,
             svc->vcpu->vcpu_id,
@@ -241,6 +266,7 @@ rt_dump_vcpu(const struct scheduler *ops, const struct rt_vcpu *svc)
             svc->cur_budget,
             svc->cur_deadline,
             svc->last_start,
+            svc->next_sched_needed,
             __vcpu_on_q(svc),
             vcpu_runnable(svc->vcpu),
             cpustr);
@@ -261,7 +287,7 @@ rt_dump_pcpu(const struct scheduler *ops, int cpu)
 static void
 rt_dump(const struct scheduler *ops)
 {
-    struct list_head *iter_sdom, *iter_svc, *runq, *depletedq, *iter;
+    struct list_head *iter_sdom, *iter_svc, *runq, *depletedq, *timerq, *iter;
     struct rt_private *prv = rt_priv(ops);
     struct rt_vcpu *svc;
     cpumask_t *online;
@@ -274,6 +300,7 @@ rt_dump(const struct scheduler *ops)
     online = cpupool_scheduler_cpumask(sdom->dom->cpupool);
     runq = rt_runq(ops);
     depletedq = rt_depletedq(ops);
+    timerq = rt_timerq(ops);
 
     spin_lock_irqsave(&prv->lock, flags);
     printk("Global RunQueue info:\n");
@@ -288,6 +315,14 @@ rt_dump(const struct scheduler *ops)
     {
         svc = __q_elem(iter);
         rt_dump_vcpu(ops, svc);
+    }
+    
+    printk("Global TimerQueue info:\n");
+    list_for_each( iter, timerq )
+    {
+        svc = __t_elem(iter);
+        printk("\tvcpu %d next_sched=%"PRI_stime"\n", svc->vcpu->vcpu_id, 
+			   svc->next_sched_needed);
     }
 
     printk("Domain info:\n");
@@ -318,9 +353,9 @@ rt_update_deadline(s_time_t now, struct rt_vcpu *svc)
 
     if ( svc->cur_deadline + (svc->period << UPDATE_LIMIT_SHIFT) > now )
     {
-        do
+        do {
             svc->cur_deadline += svc->period;
-        while ( svc->cur_deadline <= now );
+        } while ( svc->cur_deadline <= now );
     }
     else
     {
@@ -358,6 +393,13 @@ __q_remove(struct rt_vcpu *svc)
         list_del_init(&svc->q_elem);
 }
 
+static inline void
+__t_remove(struct rt_vcpu *svc)
+{
+	if( !list_empty(&svc->t_elem) )
+		list_del_init(&svc->t_elem);
+}
+
 /*
  * Insert svc with budget in RunQ according to EDF:
  * vcpus with smaller deadlines go first.
@@ -382,13 +424,81 @@ __runq_insert(const struct scheduler *ops, struct rt_vcpu *svc)
             struct rt_vcpu * iter_svc = __q_elem(iter);
             if ( svc->cur_deadline <= iter_svc->cur_deadline )
                     break;
-         }
+        }
         list_add_tail(&svc->q_elem, iter);
     }
     else
     {
         list_add(&svc->q_elem, &prv->depletedq);
     }
+}
+
+/*
+ * Insert svc into the timerq, maining sorted order.
+ */
+static void
+__timerq_insert(const struct scheduler *ops, struct rt_vcpu *svc)
+{
+    struct rt_private *prv = rt_priv(ops);
+    struct list_head *timerq = rt_timerq(ops);
+    struct list_head *iter = timerq;
+
+    ASSERT( spin_is_locked(&prv->lock) );
+
+    ASSERT( list_empty(&svc->t_elem) );
+
+	list_for_each(iter, timerq)
+	{
+		struct rt_vcpu * iter_svc = __t_elem(iter);
+		if ( svc->next_sched_needed <= iter_svc->next_sched_needed )
+				break;
+	}
+	list_add_tail(&svc->t_elem, iter);
+}
+
+/*
+ * Return the lowest time on the timerq that is after NOW
+ */
+static s_time_t
+__timerq_next(const struct scheduler *ops, s_time_t now) {
+	struct list_head *timerq = rt_timerq(ops);
+    struct list_head *iter, *tmp;
+    
+    list_for_each_safe(iter, tmp, timerq)
+	{
+		struct rt_vcpu * iter_svc = __t_elem(iter);
+		
+		if ( iter_svc->next_sched_needed > now ) {
+			return (iter_svc->next_sched_needed - now);
+		} else {
+			__t_remove(iter_svc);
+		}
+	}
+	
+	return MAX_SCHEDULE;
+}
+
+/*
+ * Updates the next_sched_needed field for a vcpu, which is used for
+ * determining the next needed schedule time for this vcpu. Then updates
+ * timerq via reinsert (could likely be optimized).
+ * Could probably be made more efficient by considering ready and
+ * waiting vcpus separately. This is a conservative first implementation.
+ */
+static void
+update_sched_time(const struct scheduler *ops, s_time_t now, struct rt_vcpu *svc)
+{	
+	/* update next needed schedule time */
+	if( test_bit(__RTDS_scheduled, &svc->flags) )
+		svc->next_sched_needed = now + svc->cur_budget;
+	else
+		svc->next_sched_needed = svc->cur_deadline;
+	
+	/* Remove and reinsert to maintain sorted order in timerq */
+	__t_remove(svc);
+	__timerq_insert(ops, svc);
+	
+	return;
 }
 
 /*
@@ -410,6 +520,7 @@ rt_init(struct scheduler *ops)
     INIT_LIST_HEAD(&prv->sdom);
     INIT_LIST_HEAD(&prv->runq);
     INIT_LIST_HEAD(&prv->depletedq);
+    INIT_LIST_HEAD(&prv->timerq);
 
     cpumask_clear(&prv->tickled);
 
@@ -516,10 +627,12 @@ rt_alloc_vdata(const struct scheduler *ops, struct vcpu *vc, void *dd)
 
     INIT_LIST_HEAD(&svc->q_elem);
     INIT_LIST_HEAD(&svc->sdom_elem);
+    INIT_LIST_HEAD(&svc->t_elem);
     svc->flags = 0U;
     svc->sdom = dd;
     svc->vcpu = vc;
     svc->last_start = 0;
+    svc->next_sched_needed = 0;
 
     svc->period = RTDS_DEFAULT_PERIOD;
     if ( !is_idle_vcpu(vc) )
@@ -549,7 +662,7 @@ rt_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
     struct rt_vcpu *svc = rt_vcpu(vc);
     s_time_t now = NOW();
 
-    /* not addlocate idle vcpu to dom vcpu list */
+    /* don't allocate idle vcpu to dom vcpu list */
     if ( is_idle_vcpu(vc) )
         return;
 
@@ -557,7 +670,10 @@ rt_vcpu_insert(const struct scheduler *ops, struct vcpu *vc)
         rt_update_deadline(now, svc);
 
     if ( !__vcpu_on_q(svc) && vcpu_runnable(vc) && !vc->is_running )
+    {
         __runq_insert(ops, svc);
+        update_sched_time(ops, now, svc);
+	}
 
     /* add rt_vcpu svc to scheduler-specific vcpu list of the dom */
     list_add_tail(&svc->sdom_elem, &svc->sdom->vcpu);
@@ -577,8 +693,9 @@ rt_vcpu_remove(const struct scheduler *ops, struct vcpu *vc)
     BUG_ON( sdom == NULL );
 
     lock = vcpu_schedule_lock_irq(vc);
-    if ( __vcpu_on_q(svc) )
-        __q_remove(svc);
+    __q_remove(svc);
+    /* Remove from timerq. Will be inserted in rt_vcpu_insert */
+    __t_remove(svc);
     vcpu_schedule_unlock_irq(lock, vc);
 
     if ( !is_idle_vcpu(vc) )
@@ -717,8 +834,9 @@ __runq_pick(const struct scheduler *ops, cpumask_t *mask)
 
 /*
  * Update vcpu's budget and
- * sort runq by insert the modifed vcpu back to runq
- * lock is grabbed before calling this function
+ * sort runq by inserting the modifed vcpu back into the runq.
+ * Sort timerq via reinsertion as well.
+ * Lock is grabbed before calling this function
  */
 static void
 __repl_update(const struct scheduler *ops, s_time_t now)
@@ -727,7 +845,7 @@ __repl_update(const struct scheduler *ops, s_time_t now)
     struct list_head *depletedq = rt_depletedq(ops);
     struct list_head *iter;
     struct list_head *tmp;
-    struct rt_vcpu *svc = NULL;
+    struct rt_vcpu *svc;
 
     list_for_each_safe(iter, tmp, runq)
     {
@@ -739,6 +857,8 @@ __repl_update(const struct scheduler *ops, s_time_t now)
         /* reinsert the vcpu if its deadline is updated */
         __q_remove(svc);
         __runq_insert(ops, svc);
+        /* Update next needed sched time if deadline is updated */
+        update_sched_time(ops, now, svc);
     }
 
     list_for_each_safe(iter, tmp, depletedq)
@@ -749,6 +869,8 @@ __repl_update(const struct scheduler *ops, s_time_t now)
             rt_update_deadline(now, svc);
             __q_remove(svc); /* remove from depleted queue */
             __runq_insert(ops, svc); /* add to runq */
+            /* Update next needed sched time since deadline is updated */
+            update_sched_time(ops, now, svc);
         }
     }
 }
@@ -771,7 +893,9 @@ rt_schedule(const struct scheduler *ops, s_time_t now, bool_t tasklet_work_sched
 
     /* burn_budget would return for IDLE VCPU */
     burn_budget(ops, scurr, now);
+    update_sched_time(ops, now, scurr);
 
+	/* Replenish budgets */
     __repl_update(ops, now);
 
     if ( tasklet_work_scheduled )
@@ -807,6 +931,7 @@ rt_schedule(const struct scheduler *ops, s_time_t now, bool_t tasklet_work_sched
         if ( snext != scurr )
         {
             __q_remove(snext);
+            __t_remove(snext);
             set_bit(__RTDS_scheduled, &snext->flags);
         }
         if ( snext->vcpu->processor != cpu )
@@ -816,7 +941,8 @@ rt_schedule(const struct scheduler *ops, s_time_t now, bool_t tasklet_work_sched
         }
     }
 
-    ret.time = MIN(snext->budget, MAX_SCHEDULE); /* sched quantum */
+    /* Use minimum from timerq */
+    ret.time = __timerq_next(ops, now);
     ret.task = snext->vcpu;
 
     /* TRACE */
@@ -857,6 +983,8 @@ rt_vcpu_sleep(const struct scheduler *ops, struct vcpu *vc)
         __q_remove(svc);
     else if ( test_bit(__RTDS_delayed_runq_add, &svc->flags) )
         clear_bit(__RTDS_delayed_runq_add, &svc->flags);
+        
+    __t_remove(svc);
 }
 
 /*
@@ -964,6 +1092,8 @@ rt_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
 
     BUG_ON( is_idle_vcpu(vc) );
 
+	update_sched_time(ops, now, svc);
+
     if ( unlikely(curr_on_cpu(vc->processor) == vc) )
         return;
 
@@ -988,6 +1118,9 @@ rt_vcpu_wake(const struct scheduler *ops, struct vcpu *vc)
     __runq_insert(ops, svc);
 
     __repl_update(ops, now);
+    
+    /* Update timerq */
+    update_sched_time(ops, now, svc);
 
     ASSERT(!list_empty(&prv->sdom));
     sdom = list_entry(prv->sdom.next, struct rt_dom, sdom_elem);
@@ -1021,8 +1154,11 @@ rt_context_saved(const struct scheduler *ops, struct vcpu *vc)
     if ( test_and_clear_bit(__RTDS_delayed_runq_add, &svc->flags) &&
          likely(vcpu_runnable(vc)) )
     {
+		s_time_t now = NOW();
+		
         __runq_insert(ops, svc);
-        __repl_update(ops, NOW());
+        __repl_update(ops, now);
+        update_sched_time(ops, now, svc);
 
         ASSERT(!list_empty(&prv->sdom));
         sdom = list_entry(prv->sdom.next, struct rt_dom, sdom_elem);
